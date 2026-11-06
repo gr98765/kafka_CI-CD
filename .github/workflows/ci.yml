@@ -10,6 +10,22 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
 
+    # Real Postgres for the duplicate / velocity tests (tests/test_reliability.py).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fintech
+          POSTGRES_PASSWORD: fintech
+          POSTGRES_DB: transactions_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fintech"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,6 +47,8 @@ jobs:
       - name: Run tests
         env:
           DISABLE_KAFKA_CONSUMER: 1
+          TEST_DB_HOST: localhost
+          REQUIRE_DB_TESTS: 1  # fail, don't skip, if the DB tests can't run
         run: |
           pytest -v
 
