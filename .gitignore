@@ -12,3 +12,5 @@ venv/
 
 # Local env files
 .env
+
+data/
