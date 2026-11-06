@@ -58,7 +58,7 @@ def consume_loop():
                 auto_offset_reset="earliest",
                 group_id="transaction-consumer-group",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - retry until Kafka is up
             time.sleep(3)  # Kafka may still be starting up
 
     for message in consumer:
@@ -112,7 +112,7 @@ def create_transaction(txn: Transaction):
         producer = get_producer()
         producer.send(TOPIC_NAME, value=txn.model_dump())
         producer.flush()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any producer failure -> 503
         raise HTTPException(status_code=503, detail=f"Kafka unavailable: {exc}")
     return {"status": "submitted", "transaction": txn.model_dump()}
 

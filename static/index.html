@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transaction Pipeline</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280;
+      --border: #e3e6eb; --accent: #2563eb;
+      --flag-bg: #fde8e8; --flag: #b42318; --clear-bg: #e7f6ec; --clear: #1a7f37;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12151b; --card: #1b1f27; --text: #e6e8ec; --muted: #9aa3b2;
+        --border: #2b313c; --accent: #60a5fa;
+        --flag-bg: #3b1d1d; --flag: #f87171; --clear-bg: #16301f; --clear: #4ade80;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 1000px; margin: 0 auto; padding: 24px 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+    .stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .stat .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+    input, select, button { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+    button { background: var(--accent); color: #fff; border: none; cursor: pointer; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    #msg { color: var(--muted); font-size: 13px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .flagged { background: var(--flag-bg); color: var(--flag); }
+    .cleared { background: var(--clear-bg); color: var(--clear); }
+    .empty { color: var(--muted); text-align: center; padding: 24px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Transaction Pipeline</h1>
+  <p class="sub">Transactions over $1,000 are flagged. Refreshes every 3 seconds.</p>
+
+  <section class="card stats">
+    <div class="stat"><div class="label">Total</div><div class="value" id="s-total">–</div></div>
+    <div class="stat"><div class="label">Flagged</div><div class="value" id="s-flagged">–</div></div>
+    <div class="stat"><div class="label">Cleared</div><div class="value" id="s-cleared">–</div></div>
+    <div class="stat"><div class="label">Volume</div><div class="value" id="s-volume">–</div></div>
+  </section>
+
+  <section class="card">
+    <form id="txn-form">
+      <input name="account_id" placeholder="Account ID" required value="acct_123">
+      <input name="merchant" placeholder="Merchant" required value="Amazon">
+      <input name="amount" type="number" step="0.01" min="0.01" placeholder="Amount" required>
+      <input name="location" placeholder="Location" value="Tucson, AZ">
+      <button type="submit">Submit transaction</button>
+    </form>
+    <div id="msg"></div>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <strong>Recent transactions</strong>
+      <select id="filter">
+        <option value="">All</option>
+        <option value="flagged">Flagged</option>
+        <option value="cleared">Cleared</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Account</th><th>Merchant</th><th>Location</th><th>Amount</th><th>Status</th><th>Time</th></tr>
+        </thead>
+        <tbody id="rows"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const $ = (id) => document.getElementById(id);
+
+  async function refresh() {
+    const status = $("filter").value;
+    try {
+      const res = await fetch("/transactions" + (status ? "?status=" + encodeURIComponent(status) : ""));
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      render(await res.json());
+    } catch (err) {
+      $("rows").innerHTML = `<tr><td colspan="7" class="empty">Could not load transactions (${esc(err.message)})</td></tr>`;
+    }
+  }
+
+  function render(txns) {
+    const flagged = txns.filter((t) => t.status === "flagged").length;
+    $("s-total").textContent = txns.length;
+    $("s-flagged").textContent = flagged;
+    $("s-cleared").textContent = txns.length - flagged;
+    $("s-volume").textContent = money.format(txns.reduce((sum, t) => sum + Number(t.amount), 0));
+
+    if (!txns.length) {
+      $("rows").innerHTML = `<tr><td colspan="7" class="empty">No transactions yet</td></tr>`;
+      return;
+    }
+    $("rows").innerHTML = txns.map((t) => `
+      <tr>
+        <td>${esc(t.id)}</td>
+        <td>${esc(t.account_id)}</td>
+        <td>${esc(t.merchant)}</td>
+        <td>${esc(t.location)}</td>
+        <td class="num">${money.format(Number(t.amount))}</td>
+        <td><span class="badge ${t.status === "flagged" ? "flagged" : "cleared"}">${esc(t.status)}</span></td>
+        <td>${esc(new Date(t.created_at).toLocaleString())}</td>
+      </tr>`).join("");
+  }
+
+  $("txn-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    data.amount = Number(data.amount);
+    if (!data.location) delete data.location;
+    try {
+      const res = await fetch("/transactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      const body = await res.json();
+      $("msg").textContent = res.ok
+        ? `Submitted ${money.format(data.amount)} — it will appear once the consumer processes it.`
+        : `Error: ${typeof body.detail === "string" ? body.detail : "invalid input"}`;
+    } catch (err) {
+      $("msg").textContent = "Error: " + err.message;
+    }
+  });
+
+  $("filter").addEventListener("change", refresh);
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>
