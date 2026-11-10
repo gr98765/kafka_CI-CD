@@ -27,7 +27,7 @@ services:
       POSTGRES_PASSWORD: fintech
       POSTGRES_DB: transactions_db
     ports:
-      - "5432:5432"
+      - "5433:5432"  # 5432 is often taken by a local Postgres; scripts use DB_PORT=5433
     volumes:
       - ./db-init-script.sql:/docker-entrypoint-initdb.d/init.sql
 
@@ -44,5 +44,21 @@ services:
       DB_USER: fintech
       DB_PASSWORD: fintech
       DB_NAME: transactions_db
+      DISABLE_KAFKA_CONSUMER: "1"  # the consumer runs in its own service below
     volumes:
       - ./static:/app/static
+
+  # Same image as the API, but runs only the Kafka -> Postgres consumer, so it
+  # can be killed and restarted on its own (scripts/kill_test.py).
+  consumer:
+    build: .
+    command: ["python", "-m", "app.consumer"]
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DB_HOST: postgres
+      DB_USER: fintech
+      DB_PASSWORD: fintech
+      DB_NAME: transactions_db

@@ -34,6 +34,11 @@ POST /transactions  →  Kafka topic "transactions"  →  background consumer
 docker compose up --build
 ```
 
+Postgres is published on host port **5433** (not the default 5432), because 5432 is often
+already taken by a locally installed Postgres. Inside the compose network the services still
+talk to `postgres:5432`; only connections from your machine (e.g. `psql -h localhost -p 5433`,
+or the `scripts/` tools, which default to `DB_PORT=5433`) use the new port.
+
 Then:
 - Dashboard: http://localhost:8000
 - API docs (Swagger): http://localhost:8000/docs
