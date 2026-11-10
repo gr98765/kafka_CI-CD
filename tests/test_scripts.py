@@ -101,6 +101,10 @@ def test_rule_hits_matches_consumer_rules():
     assert not any(hits[f"c{i}"] for i in range(7))
     assert hits["big"] == {"amount"} and hits["edge"] == set()
 
+    hits5 = rule_hits(rows, velocity_limit=5)
+    # limit 5: C's payments 31s apart hold up to 6 per 180s, so c4..c6 trip too
+    assert {p for p, h in hits5.items() if "velocity" in h} == {"a4", "a5", "a6", "b4", "b5", "c4", "c5", "c6"}
+
 
 def test_compare_setups():
     hits = {"p1": {"velocity"}, "p2": set(), "p4": {"amount"}, "p5": {"amount", "velocity"}, "p6": set()}

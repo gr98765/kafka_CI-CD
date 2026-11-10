@@ -83,11 +83,13 @@ def load_rule_inputs(conn) -> list[tuple[str, str, datetime, float]]:
         return [(pid, acct, t, float(amount)) for pid, acct, t, amount in cur]
 
 
-def rule_hits(rows: list[tuple[str, str, datetime, float]]) -> dict[str, set[str]]:
+def rule_hits(
+    rows: list[tuple[str, str, datetime, float]], velocity_limit: int = VELOCITY_LIMIT
+) -> dict[str, set[str]]:
     """payment_id -> the rules it trips, a subset of {'amount', 'velocity'}.
 
     Same definitions as app.main: amount > FLAG_THRESHOLD; velocity when the
-    payment is the VELOCITY_LIMIT-th or later from its account within
+    payment is the velocity_limit-th (default VELOCITY_LIMIT) or later from its account within
     [event_time - window, event_time], ties on event_time ordered by payment_id.
     """
     by_account: dict[str, list[tuple[datetime, str, float]]] = defaultdict(list)
@@ -104,7 +106,7 @@ def rule_hits(rows: list[tuple[str, str, datetime, float]]) -> dict[str, set[str
             hits[pid] = set()
             if amount > FLAG_THRESHOLD:
                 hits[pid].add("amount")
-            if i - left + 1 >= VELOCITY_LIMIT:
+            if i - left + 1 >= velocity_limit:
                 hits[pid].add("velocity")
     return hits
 
@@ -121,6 +123,32 @@ def apply_setup(hits: dict[str, set[str]], stored: dict, rules: set[str]) -> dic
 def compare_setups(labels: dict, amounts: dict, stored: dict, hits: dict) -> dict[str, dict]:
     """Setup name -> compute() summary, every setup scored on the same stored payments."""
     return {name: compute(labels, amounts, apply_setup(hits, stored, rules)) for name, rules in SETUPS.items()}
+
+
+def sweep_velocity(labels: dict, amounts: dict, stored: dict, rows: list, limits: list[int]) -> list[tuple]:
+    """[(limit, setup, compute() summary)] for velocity only and both, at each limit."""
+    out = []
+    for limit in limits:
+        hits = rule_hits(rows, limit)
+        for setup in ("velocity only", "both"):
+            out.append((limit, setup, compute(labels, amounts, apply_setup(hits, stored, SETUPS[setup]))))
+    return out
+
+
+def sweep_table(sweep: list[tuple]) -> str:
+    lines = [
+        f"| Velocity limit (in {VELOCITY_WINDOW_SECONDS} s) | Setup | Recall | Precision | False alarms |",
+        "|---:|---|---:|---:|---:|",
+    ]
+    for limit, setup, s in sweep:
+        current = " (current)" if limit == VELOCITY_LIMIT else ""
+        lines.append(
+            f"| {limit}{current} | {setup} "
+            f"| {_fmt_pct(s['recall'])} ({s['caught']:,}/{s['fraud']:,}) "
+            f"| {_fmt_pct(s['precision'])} ({s['caught']:,}/{s['flagged']:,}) "
+            f"| {s['false_alarms']:,} |"
+        )
+    return "\n".join(lines)
 
 
 def status_mismatches(labels: dict, stored: dict, hits: dict) -> int:
@@ -221,7 +249,7 @@ def comparison_table(results: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
-def comparison_markdown(results: dict[str, dict], mismatches: int) -> str:
+def comparison_markdown(results: dict[str, dict], mismatches: int, sweep: list[tuple] = ()) -> str:
     s = results["both"]
     return "\n".join(
         [
@@ -242,6 +270,7 @@ def comparison_markdown(results: dict[str, dict], mismatches: int) -> str:
             "",
             f"Check: re-running both rules disagrees with the status stored in Postgres on {mismatches:,} payments.",
             "",
+            *(["## Velocity threshold", "", sweep_table(sweep), ""] if sweep else []),
         ]
     )
 
@@ -251,24 +280,30 @@ def main() -> None:
     p.add_argument("--labels", type=Path, default=DATA / "labels.csv")
     p.add_argument("--truth", type=Path, default=DATA / "payments_truth.jsonl")
     p.add_argument("--out", type=Path, default=RESULTS / "rules_comparison.md")
+    p.add_argument("--velocity-limits", default="5,7,9", help="comma-separated limits to compare")
     args = p.parse_args()
+    limits = [int(x) for x in args.velocity_limits.split(",") if x.strip()]
 
     conn = db_connect()
     try:
         stored = load_stored(conn)
-        hits = rule_hits(load_rule_inputs(conn))
+        rows = load_rule_inputs(conn)
     finally:
         conn.close()
+    hits = rule_hits(rows)
     labels, amounts = load_labels(args.labels), load_amounts(args.truth)
     print_report(compute(labels, amounts, stored))
 
     results = compare_setups(labels, amounts, stored, hits)
     mismatches = status_mismatches(labels, stored, hits)
+    sweep = sweep_velocity(labels, amounts, stored, rows, limits)
     print()
     print(comparison_table(results))
     print(f"\ncheck: re-running both rules disagrees with Postgres status on {mismatches:,} payments")
+    print()
+    print(sweep_table(sweep))
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(comparison_markdown(results, mismatches), encoding="utf-8")
+    args.out.write_text(comparison_markdown(results, mismatches, sweep), encoding="utf-8")
     print(f"written to {args.out}")
 
 

@@ -33,6 +33,10 @@ TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 SHOPPING_TRIP_PER_DAY = 0.02  # chance per account per day (3-4 payments, minutes apart)
 BILLING_BATCH_ON_FIRST = 0.08  # chance per account on the 1st (3-5 bills in seconds)
 BIG_PURCHASE_RATE = 0.001  # share of normal payments that are legit and > $1000
+HEAVY_BURST_ACCOUNT_RATE = 0.03  # share of accounts with legit 6-9 payments in <= 3 min
+HEAVY_BURST_DAYS = (2, 4)  # on this many different days each
+HEAVY_BURST_SIZE = (6, 9)
+HEAVY_BURST_MAX_SPAN = 180  # seconds from first to last payment
 FRAUD_PATTERN_WEIGHTS = {
     "velocity_burst": 0.35,
     "card_testing": 0.25,
@@ -196,6 +200,44 @@ def billing_batch(
         out.append(Event(acct, merchant, when, amount, "online"))
         when += timedelta(seconds=rng.randint(5, 25))
     return out
+
+
+def heavy_burst(
+    rng: random.Random, world: World, acct: Account, day: datetime
+) -> list[Event]:
+    """6-9 legit payments within 3 minutes: a cart checkout split into separate
+    charges at one merchant, or a batch of renewals at several. Normal amounts
+    for the category, labelled normal; dense enough to trip a velocity rule."""
+    n = rng.randint(*HEAVY_BURST_SIZE)
+    span = rng.randint(n * 10, HEAVY_BURST_MAX_SPAN)
+    base = day + timedelta(seconds=rng.randint(acct.start_hour * 3600, acct.end_hour * 3600 - span))
+    if rng.random() < 0.5:  # split checkout: one shop, one category
+        category = rng.choice(["retail", "groceries", "entertainment"])
+        shop = rng.choice(world.by_cc[(acct.home_country, category)])
+        picks = [(shop, category)] * n
+    else:  # renewals: subscriptions and utilities, different merchants
+        picks = []
+        for _ in range(n):
+            category = rng.choice(["subscriptions", "utilities"])
+            picks.append((rng.choice(world.by_cc[(acct.home_country, category)]), category))
+    return [
+        Event(acct, m, base + timedelta(seconds=off), normal_amount(rng, cat, acct.spend_factor), "online")
+        for (m, cat), off in zip(picks, burst_offsets(rng, n, span), strict=True)
+    ]
+
+
+def heavy_burst_events(
+    rng: random.Random, world: World, accts: list[Account]
+) -> tuple[list[Event], int]:
+    """(events, number of bursts) for HEAVY_BURST_ACCOUNT_RATE of the accounts."""
+    events: list[Event] = []
+    bursts = 0
+    for acct in rng.sample(accts, round(len(accts) * HEAVY_BURST_ACCOUNT_RATE)):
+        k = min(rng.randint(*HEAVY_BURST_DAYS), world.days)
+        for d in sorted(rng.sample(range(world.days), k)):
+            events += heavy_burst(rng, world, acct, world.start + timedelta(days=d))
+            bursts += 1
+    return events, bursts
 
 
 # --- fraud -----------------------------------------------------------------
@@ -441,6 +483,9 @@ def generate(
     counter = [0]
     for acct in rng.sample(accts, round(accounts * fraud_account_rate)):
         events += fraud_events(rng, world, acct, counter)
+    # Own RNG stream, so adding heavy bursts leaves every other event unchanged.
+    heavy, heavy_bursts = heavy_burst_events(random.Random(f"{seed}-heavy"), world, accts)
+    events += heavy
 
     rows = to_records(events)
     raw, mess_log = apply_mess(rng, rows)
@@ -490,6 +535,8 @@ def generate(
         "fraud_payments": sum(e.is_fraud for _, _, e in rows),
         "fraud_incidents": counter[0],
         "fraud_by_pattern": dict(Counter(e.pattern for _, _, e in rows if e.is_fraud)),
+        "legit_heavy_bursts": heavy_bursts,
+        "legit_heavy_burst_payments": len(heavy),
         "mess_by_issue": dict(Counter(m["issue"] for m in mess_log)),
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))

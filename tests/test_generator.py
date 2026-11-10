@@ -115,6 +115,28 @@ def test_impossible_travel_is_abroad(data):
     assert all(p["country"] != home[p["account_id"]] for p in travel)
 
 
+def test_some_legit_account_has_7_in_180_seconds(data):
+    """Heavy legit bursts exist, so a 7-in-180s velocity rule has honest false alarms."""
+    out, manifest = data
+    assert manifest["legit_heavy_bursts"] > 0
+    legit = {r["payment_id"] for r in read_csv(out / "labels.csv") if r["is_fraud"] == "0"}
+    times = defaultdict(list)
+    for r in read_jsonl(out / "payments_truth.jsonl"):
+        if r["payment_id"] in legit:
+            times[r["account_id"]].append(datetime.strptime(r["timestamp"], TS_FORMAT).timestamp())
+
+    def max_in_window(ts, window=180):
+        ts.sort()
+        left, best = 0, 0
+        for i, t in enumerate(ts):
+            while ts[left] < t - window:
+                left += 1
+            best = max(best, i - left + 1)
+        return best
+
+    assert max(max_in_window(ts) for ts in times.values()) >= 7
+
+
 def test_poisson_average():
     import random
 

@@ -221,6 +221,12 @@ def ensure_nodedup_table() -> None:
         with conn.cursor() as cur:
             # LIKE copies columns, NOT NULLs and defaults, but no primary key or indexes.
             cur.execute(f"CREATE TABLE IF NOT EXISTS {NODEDUP_TABLE} (LIKE transactions INCLUDING DEFAULTS)")
+            # Same non-unique index as transactions, so the velocity query stays fast;
+            # being non-unique, it does not stop duplicates.
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_nodedup_account_time "
+                f"ON {NODEDUP_TABLE} (account_id, event_time, payment_id)"
+            )
     finally:
         conn.close()
 
