@@ -62,6 +62,19 @@ DISABLE_KAFKA_CONSUMER=1 pytest -v
 Tests use mocks for Kafka and Postgres, so you don't need the full stack running just to
 test the API logic.
 
+## Crash test
+
+`python -m scripts.kill_test` replays a slice of the synthetic data, SIGKILLs the consumer at
+several points (25%, 50%, 75% by default), restarts it, and prints rows stored at the kill,
+messages re-delivered after the restart and ignored, and final sent / stored / lost / duplicated.
+
+It then does one more run with duplicate protection **off**, using the `DEDUP_DISABLED=1` test
+switch on the consumer: plain `INSERT` (no `ON CONFLICT`) into `transactions_nodedup`, a copy of
+the table without a primary key, to show how many duplicates re-delivery would create. The script
+sets and resets the switch itself (`DEDUP_DISABLED=1 docker compose up -d consumer`, then back to
+`0`). It is for this experiment only: never set it in normal operation. The real `transactions`
+table is not touched while it is on.
+
 ## CI/CD
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`:

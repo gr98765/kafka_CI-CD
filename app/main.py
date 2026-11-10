@@ -147,12 +147,19 @@ def classify(amount: float) -> str:
     return "flagged" if amount > FLAG_THRESHOLD else "cleared"
 
 
-INSERT_SQL = """
-INSERT INTO transactions (payment_id, account_id, merchant_id, merchant, amount, currency,
+# Experiment only (scripts/kill_test.py --runs ... plain-insert run): with
+# DEDUP_DISABLED=1 the consumer uses a plain INSERT into transactions_nodedup,
+# a copy of the table with no primary key, to show what duplicate protection
+# prevents. Never set it in normal operation.
+DEDUP_DISABLED = os.getenv("DEDUP_DISABLED") == "1"
+TABLE = "transactions_nodedup" if DEDUP_DISABLED else "transactions"
+
+INSERT_SQL = f"""
+INSERT INTO {TABLE} (payment_id, account_id, merchant_id, merchant, amount, currency,
                           country, channel, location, event_time, status, reason)
 VALUES (%(payment_id)s, %(account_id)s, %(merchant_id)s, %(merchant)s, %(amount)s, %(currency)s,
         %(country)s, %(channel)s, %(location)s, %(event_time)s, %(status)s, %(reason)s)
-ON CONFLICT (payment_id) DO NOTHING
+{"" if DEDUP_DISABLED else "ON CONFLICT (payment_id) DO NOTHING"}
 RETURNING payment_id
 """
 
@@ -165,7 +172,7 @@ RETURNING payment_id
 # because a late-arriving payment can push an already-stored later payment over
 # the limit. Adding payments only ever raises counts, so nothing needs un-flagging.
 VELOCITY_SQL = """
-UPDATE transactions AS t
+UPDATE {table} AS t
 SET status = 'flagged', reason = 'velocity'
 WHERE t.account_id = %(account_id)s
   AND t.status = 'cleared'
@@ -173,13 +180,13 @@ WHERE t.account_id = %(account_id)s
   AND t.event_time <= %(event_time)s + make_interval(secs => %(window)s)
   AND (
       SELECT count(*)
-      FROM transactions AS w
+      FROM {table} AS w
       WHERE w.account_id = t.account_id
         AND w.event_time >= t.event_time - make_interval(secs => %(window)s)
         AND (w.event_time, w.payment_id) <= (t.event_time, t.payment_id)
   ) >= %(limit)s
 RETURNING t.payment_id
-"""
+""".format(table=TABLE)
 
 
 def store_payment(conn, event: PaymentEvent) -> str:
@@ -199,6 +206,7 @@ def store_payment(conn, event: PaymentEvent) -> str:
         cur.execute(INSERT_SQL, row)
         if cur.fetchone() is None:
             conn.rollback()
+            log.info("duplicate ignored: %s", event.payment_id)
             return "duplicate"
         cur.execute(
             VELOCITY_SQL,

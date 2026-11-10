@@ -58,6 +58,7 @@ services:
       - postgres
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DEDUP_DISABLED: ${DEDUP_DISABLED:-0}  # 1 only for the kill test's plain-INSERT run
       DB_HOST: postgres
       DB_USER: fintech
       DB_PASSWORD: fintech

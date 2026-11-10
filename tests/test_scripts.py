@@ -113,3 +113,10 @@ def test_compare_setups():
     assert r["velocity only"]["dollars_blocked"] == 100.0
     assert status_mismatches(LABELS, stored, hits) == 0
     assert len(comparison_table(r).splitlines()) == 5  # header, divider, 3 setups
+
+
+def test_drop_resends_keeps_first_copy():
+    from scripts.kill_test import drop_resends
+
+    records = [{"payment_id": "p1", "n": 1}, {"payment_id": "p2"}, {"payment_id": "p1", "n": 2}]
+    assert drop_resends(records) == [{"payment_id": "p1", "n": 1}, {"payment_id": "p2"}]
