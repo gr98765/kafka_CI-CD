@@ -1,10 +1,12 @@
 """The pure parts of scripts/: scoring maths, 422 parsing, kill-test tagging."""
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from scripts.kill_test import tag_record
 from scripts.replay import Result, rejection_reason, summarize
-from scripts.score import compute
+from scripts.score import compare_setups, comparison_table, compute, rule_hits, status_mismatches
 
 LABELS = {
     "p1": (True, "velocity_burst"),  # fraud, flagged        -> caught
@@ -77,3 +79,37 @@ def test_tag_record_tags_ids_only():
         "amount": "$5",
     }
     assert record["payment_id"] == "pay_1"  # original untouched
+
+
+def _burst(prefix, account, n, step_s=10):
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    return [(f"{prefix}{i}", account, t0 + timedelta(seconds=i * step_s), 5.0) for i in range(n)]
+
+
+def test_rule_hits_matches_consumer_rules():
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    rows = (
+        _burst("a", "A", 7)  # 7 within 60s: only the 7th trips velocity
+        + _burst("b", "B", 6)  # 6 within 50s: nothing
+        + _burst("c", "C", 7, step_s=31)  # 7 spread over 186s: nothing
+        + [("big", "D", t0, 1000.01), ("edge", "D", t0, 1000.00)]
+    )
+    hits = rule_hits(rows)
+    assert hits["a6"] == {"velocity"}
+    assert all(hits[f"a{i}"] == set() for i in range(6))
+    assert not any(hits[f"b{i}"] for i in range(6))
+    assert not any(hits[f"c{i}"] for i in range(7))
+    assert hits["big"] == {"amount"} and hits["edge"] == set()
+
+
+def test_compare_setups():
+    hits = {"p1": {"velocity"}, "p2": set(), "p4": {"amount"}, "p5": {"amount", "velocity"}, "p6": set()}
+    stored = {**STORED, "p5": ("flagged", "amount", 10.0)}
+    r = compare_setups(LABELS, AMOUNTS, stored, hits)
+
+    assert (r["amount only"]["caught"], r["amount only"]["false_alarms"]) == (0, 2)
+    assert (r["velocity only"]["caught"], r["velocity only"]["false_alarms"]) == (1, 1)
+    assert (r["both"]["caught"], r["both"]["false_alarms"]) == (1, 2)
+    assert r["velocity only"]["dollars_blocked"] == 100.0
+    assert status_mismatches(LABELS, stored, hits) == 0
+    assert len(comparison_table(r).splitlines()) == 5  # header, divider, 3 setups
