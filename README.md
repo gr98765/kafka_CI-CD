@@ -34,6 +34,11 @@ POST /transactions  →  Kafka topic "transactions"  →  background consumer
 docker compose up --build
 ```
 
+Postgres is published on host port **5433** (not the default 5432), because 5432 is often
+already taken by a locally installed Postgres. Inside the compose network the services still
+talk to `postgres:5432`; only connections from your machine (e.g. `psql -h localhost -p 5433`,
+or the `scripts/` tools, which default to `DB_PORT=5433`) use the new port.
+
 Then:
 - Dashboard: http://localhost:8000
 - API docs (Swagger): http://localhost:8000/docs
@@ -56,6 +61,19 @@ DISABLE_KAFKA_CONSUMER=1 pytest -v
 
 Tests use mocks for Kafka and Postgres, so you don't need the full stack running just to
 test the API logic.
+
+## Crash test
+
+`python -m scripts.kill_test` replays a slice of the synthetic data, SIGKILLs the consumer at
+several points (25%, 50%, 75% by default), restarts it, and prints rows stored at the kill,
+messages re-delivered after the restart and ignored, and final sent / stored / lost / duplicated.
+
+It then does one more run with duplicate protection **off**, using the `DEDUP_DISABLED=1` test
+switch on the consumer: plain `INSERT` (no `ON CONFLICT`) into `transactions_nodedup`, a copy of
+the table without a primary key, to show how many duplicates re-delivery would create. The script
+sets and resets the switch itself (`DEDUP_DISABLED=1 docker compose up -d consumer`, then back to
+`0`). It is for this experiment only: never set it in normal operation. The real `transactions`
+table is not touched while it is on.
 
 ## CI/CD
 

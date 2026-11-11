@@ -45,7 +45,7 @@
 <body>
 <main>
   <h1>Transaction Pipeline</h1>
-  <p class="sub">Transactions over $1,000 are flagged. Refreshes every 3 seconds.</p>
+  <p class="sub">Flagged when over $1,000, or the 7th+ payment from one account within 180 seconds. Refreshes every 3 seconds.</p>
 
   <section class="card stats">
     <div class="stat"><div class="label">Total</div><div class="value" id="s-total">–</div></div>
@@ -77,7 +77,7 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>ID</th><th>Account</th><th>Merchant</th><th>Location</th><th>Amount</th><th>Status</th><th>Time</th></tr>
+          <tr><th>Payment</th><th>Account</th><th>Merchant</th><th>Location</th><th>Amount</th><th>Status</th><th>Time</th></tr>
         </thead>
         <tbody id="rows"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
       </table>
@@ -115,13 +115,13 @@
     }
     $("rows").innerHTML = txns.map((t) => `
       <tr>
-        <td>${esc(t.id)}</td>
+        <td>${esc(t.payment_id)}</td>
         <td>${esc(t.account_id)}</td>
-        <td>${esc(t.merchant)}</td>
-        <td>${esc(t.location)}</td>
+        <td>${esc(t.merchant || t.merchant_id)}</td>
+        <td>${esc(t.location && t.location !== "unknown" ? t.location : t.country)}</td>
         <td class="num">${money.format(Number(t.amount))}</td>
-        <td><span class="badge ${t.status === "flagged" ? "flagged" : "cleared"}">${esc(t.status)}</span></td>
-        <td>${esc(new Date(t.created_at).toLocaleString())}</td>
+        <td><span class="badge ${t.status === "flagged" ? "flagged" : "cleared"}">${esc(t.status)}${t.reason ? " · " + esc(t.reason) : ""}</span></td>
+        <td>${esc(new Date(t.event_time).toLocaleString())}</td>
       </tr>`).join("");
   }
 
