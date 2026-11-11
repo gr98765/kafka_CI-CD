@@ -171,8 +171,8 @@ RETURNING payment_id
 # It checks the new payment AND the account's later payments within 180s,
 # because a late-arriving payment can push an already-stored later payment over
 # the limit. Adding payments only ever raises counts, so nothing needs un-flagging.
-VELOCITY_SQL = """
-UPDATE {table} AS t
+VELOCITY_SQL = f"""
+UPDATE {TABLE} AS t
 SET status = 'flagged', reason = 'velocity'
 WHERE t.account_id = %(account_id)s
   AND t.status = 'cleared'
@@ -180,13 +180,13 @@ WHERE t.account_id = %(account_id)s
   AND t.event_time <= %(event_time)s + make_interval(secs => %(window)s)
   AND (
       SELECT count(*)
-      FROM {table} AS w
+      FROM {TABLE} AS w
       WHERE w.account_id = t.account_id
         AND w.event_time >= t.event_time - make_interval(secs => %(window)s)
         AND (w.event_time, w.payment_id) <= (t.event_time, t.payment_id)
   ) >= %(limit)s
 RETURNING t.payment_id
-""".format(table=TABLE)
+"""
 
 
 def store_payment(conn, event: PaymentEvent) -> str:

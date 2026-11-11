@@ -255,18 +255,24 @@ def comparison_markdown(results: dict[str, dict], mismatches: int, sweep: list[t
         [
             "# Rule comparison",
             "",
-            f"Scored on {s['labelled']:,} labelled payments ({s['fraud']:,} fraud, "
-            f"${s['fraud_dollars']:,.2f} in fraud); {s['stored']:,} of them were stored in Postgres.",
+            (
+                f"Scored on {s['labelled']:,} labelled payments ({s['fraud']:,} fraud, "
+                f"${s['fraud_dollars']:,.2f} in fraud); {s['stored']:,} of them were stored in Postgres."
+            ),
             "",
             f"- **amount**: amount > ${FLAG_THRESHOLD:,.2f}",
-            f"- **velocity**: {VELOCITY_LIMIT}th-or-later payment by one account within "
-            f"{VELOCITY_WINDOW_SECONDS} s (by event time)",
+            (
+                f"- **velocity**: {VELOCITY_LIMIT}th-or-later payment by one account within "
+                f"{VELOCITY_WINDOW_SECONDS} s (by event time)"
+            ),
             "",
             comparison_table(results),
             "",
-            "Recall = fraud flagged / all labelled fraud (fraud that was never stored counts as missed). "
-            "Precision = fraud flagged / all flagged. False alarms = legit payments flagged. "
-            "Dollars blocked = amount of the fraud payments flagged, and its share of all fraud dollars.",
+            (
+                "Recall = fraud flagged / all labelled fraud (fraud that was never stored counts as missed). "
+                "Precision = fraud flagged / all flagged. False alarms = legit payments flagged. "
+                "Dollars blocked = amount of the fraud payments flagged, and its share of all fraud dollars."
+            ),
             "",
             f"Check: re-running both rules disagrees with the status stored in Postgres on {mismatches:,} payments.",
             "",

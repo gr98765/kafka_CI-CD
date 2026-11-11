@@ -6,7 +6,13 @@ import pytest
 
 from scripts.kill_test import tag_record
 from scripts.replay import Result, rejection_reason, summarize
-from scripts.score import compare_setups, comparison_table, compute, rule_hits, status_mismatches
+from scripts.score import (
+    compare_setups,
+    comparison_table,
+    compute,
+    rule_hits,
+    status_mismatches,
+)
 
 LABELS = {
     "p1": (True, "velocity_burst"),  # fraud, flagged        -> caught
