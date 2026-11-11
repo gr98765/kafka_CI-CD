@@ -51,37 +51,19 @@ def test_create_transaction_publishes_to_kafka(client):
 
     assert resp.status_code == 202
     sent = resp.json()["transaction"]
-    assert sent["payment_id"] == "pay_00000001"
-    assert sent["amount"] == 12.5
-    assert datetime.fromisoformat(sent["timestamp"]) == datetime(
-        2026, 10, 1, 12, tzinfo=UTC
-    )
-    producer.send.assert_called_once_with(TOPIC_NAME, key=b"ACC00012", value=sent)
+    assert sent == GENERATOR_TXN  # published exactly as received
+    producer.send.assert_called_once_with(TOPIC_NAME, key=b"ACC00012", value=GENERATOR_TXN)
     producer.send.return_value.get.assert_called_once()  # waits for Kafka's ack
 
 
-def test_create_transaction_fills_in_id_time_and_location(client):
+def test_kafka_key_is_the_normalized_account(client):
+    """One account's payments share a partition even when the ID is messy."""
     producer = MagicMock()
-    payload = {k: v for k, v in VALID_TXN.items() if k != "location"}
     with patch("app.main.get_producer", return_value=producer):
-        first = client.post("/transactions", json=payload).json()["transaction"]
-        second = client.post("/transactions", json=payload).json()["transaction"]
+        client.post("/transactions", json={**GENERATOR_TXN, "account_id": " acc00012 "})
 
-    assert first["payment_id"].startswith("pay_")
-    assert first["payment_id"] != second["payment_id"]
-    assert first["location"] == "unknown"
-    assert datetime.fromisoformat(first["timestamp"]).tzinfo is not None
-
-
-def test_timestamp_without_timezone_is_utc(client):
-    producer = MagicMock()
-    payload = {**GENERATOR_TXN, "timestamp": "2026-10-01T12:00:00"}
-    with patch("app.main.get_producer", return_value=producer):
-        sent = client.post("/transactions", json=payload).json()["transaction"]
-
-    assert datetime.fromisoformat(sent["timestamp"]) == datetime(
-        2026, 10, 1, 12, tzinfo=UTC
-    )
+    assert producer.send.call_args.kwargs["key"] == b"ACC00012"
+    assert producer.send.call_args.kwargs["value"]["account_id"] == " acc00012 "  # body untouched
 
 
 def test_create_transaction_kafka_down_returns_503(client):
@@ -104,17 +86,40 @@ def test_create_transaction_kafka_not_acking_returns_503(client):
 @pytest.mark.parametrize(
     "payload",
     [
-        {**VALID_TXN, "amount": 0},
-        {**VALID_TXN, "amount": -5},
-        {**VALID_TXN, "amount": "$12.50"},
-        {**VALID_TXN, "account_id": ""},
-        {**VALID_TXN, "timestamp": "not a time"},
-        {k: v for k, v in VALID_TXN.items() if k != "account_id"},
+        {**GENERATOR_TXN, "amount": 0},
+        {**GENERATOR_TXN, "amount": -5},
+        {**GENERATOR_TXN, "amount": "$12.50"},
+        {**GENERATOR_TXN, "amount": "12.50"},
+        {**GENERATOR_TXN, "timestamp": 1790856000},
+        {**GENERATOR_TXN, "timestamp": "not a time"},
+        {**GENERATOR_TXN, "account_id": ""},
+        {**GENERATOR_TXN, "currency": "XXX"},
+        {k: v for k, v in GENERATOR_TXN.items() if k != "payment_id"},
+        {k: v for k, v in GENERATOR_TXN.items() if k != "account_id"},
+        {},
     ],
+    ids=["zero", "negative", "dollar-string", "number-string", "epoch", "bad-time",
+         "blank-account", "other-currency", "no-payment-id", "no-account", "empty-object"],
 )
-def test_create_transaction_rejects_invalid_payload(client, payload):
-    with patch("app.main.get_producer") as get_producer:
+def test_any_json_object_is_accepted_and_published_as_is(client, payload):
+    """Record problems are for the clean step to fix or quarantine, not the API."""
+    producer = MagicMock()
+    with patch("app.main.get_producer", return_value=producer):
         resp = client.post("/transactions", json=payload)
+
+    assert resp.status_code == 202
+    assert producer.send.call_args.kwargs["value"] == payload
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"this is not json", b'{"amount": 5', b"[1, 2, 3]", b'"just a string"', b"42", b"null",
+     b'{"amount": NaN}'],
+    ids=["not-json", "truncated", "array", "string", "number", "null", "nan"],
+)
+def test_only_non_objects_are_rejected(client, body):
+    with patch("app.main.get_producer") as get_producer:
+        resp = client.post("/transactions", content=body, headers={"Content-Type": "application/json"})
 
     assert resp.status_code == 422
     get_producer.assert_not_called()
@@ -161,6 +166,7 @@ def test_list_transactions_returns_rows(client):
     assert body[0]["status"] == "flagged"
     assert body[0]["reason"] == "amount"
     sql, _ = cursor.execute.call_args.args
+    assert "FROM payments_clean" in sql
     assert "WHERE" not in sql
 
 
