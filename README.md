@@ -99,7 +99,8 @@ in `raw_payments`.
 
 It then does one more run with duplicate protection **off**, using the `DEDUP_DISABLED=1` test
 switch on the consumer: plain `INSERT` (no `ON CONFLICT`) into `raw_payments_nodedup`, a copy of
-the raw table without the (partition, offset) unique key, to show how many duplicates re-delivery
+the raw table without the (partition, offset) unique key (it gets a plain, non-unique index on
+`payment_id` so the script's counts stay fast), to show how many duplicates re-delivery
 would create. The script
 sets and resets the switch itself (`DEDUP_DISABLED=1 docker compose up -d consumer`, then back to
 `0`). It is for this experiment only: never set it in normal operation. The real `raw_payments`

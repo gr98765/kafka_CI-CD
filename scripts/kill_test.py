@@ -224,6 +224,13 @@ def ensure_nodedup_table() -> None:
         with conn.cursor() as cur:
             # LIKE copies columns, NOT NULLs and defaults, but no unique keys or indexes.
             cur.execute(f"CREATE TABLE IF NOT EXISTS {NODEDUP_TABLE} (LIKE {RAW_TABLE} INCLUDING DEFAULTS)")
+            # Non-unique, so duplicates still go in; it only keeps the per-run
+            # counts (WHERE payment_id LIKE 'tag\_%') from scanning the whole table.
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS {NODEDUP_TABLE}_payment_id ON {NODEDUP_TABLE} "
+                f"(({PID}) text_pattern_ops)"
+            )
+        conn.commit()
     finally:
         conn.close()
 
