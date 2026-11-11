@@ -130,3 +130,31 @@ def test_drop_resends_keeps_first_copy():
 
     records = [{"payment_id": "p1", "n": 1}, {"payment_id": "p2"}, {"payment_id": "p1", "n": 2}]
     assert drop_resends(records) == [{"payment_id": "p1", "n": 1}, {"payment_id": "p2"}]
+
+
+def test_clean_score_evaluate():
+    from collections import Counter
+    from decimal import Decimal
+
+    from scripts.clean_score import Tables, evaluate
+
+    t0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    truth = {
+        p: {"payment_id": p, "account_id": "ACC1", "amount": 12.5, "currency": "USD", "timestamp": "2026-10-01T12:00:00Z"}
+        for p in ("a", "b", "c", "d", "e")
+    }
+    mess = {"a": "amount_string", "b": "negative_amount", "c": "duplicate", "d": "id_whitespace"}
+    good = ("ACC1", Decimal("12.50"), "USD", t0, "cleared", None)
+    tables = Tables(
+        raw_rows=6,
+        raw_copies=Counter({"a": 1, "b": 1, "c": 2, "d": 1, "e": 1}),
+        clean={"a": good, "c": good, "d": ("acc1", *good[1:])},  # d kept but not fixed; e quarantined wrongly
+        quarantine=[("b", "non_positive_amount"), ("e", "bad_timestamp")],
+    )
+    e = evaluate(truth, mess, tables)
+
+    assert e["outcome"] == {"a": "fixed", "b": "quarantined", "c": "fixed", "d": "kept_wrong", "e": "quarantined"}
+    assert e["wrongly_quarantined"] == ["e"] and e["wrongly_kept"] == []
+    assert (e["in_clean"], e["in_quarantine"], e["later_copies"]) == (3, 2, 1)
+    neg = next(r for r in e["rows"] if r["kind"] == "negative_amount")
+    assert (neg["quarantined"], neg["expected_reason"]) == (1, 1)

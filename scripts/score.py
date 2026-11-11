@@ -1,11 +1,12 @@
-"""Score the flags stored in Postgres against the generator's labels.
+"""Score the flags in payments_clean against the generator's labels.
 
     python -m scripts.score
 
 Run after scripts.replay once the consumer has caught up. Only payment_ids that
 appear in labels.csv are scored, so dashboard or kill-test rows are ignored.
-Labelled payments that never reached Postgres (rejected by the API) count as
-not flagged: a fraud payment that was never stored was not caught.
+Labelled payments that are not in payments_clean (quarantined, or never
+received) count as not flagged: a fraud payment that was not kept was not caught.
+Run app.clean first; scripts.clean_score reports the cleaning itself.
 
 It also compares three rule setups on the same stored payments: amount rule
 only, velocity rule only, and both. The table is printed and written to
@@ -31,6 +32,7 @@ from app.main import FLAG_THRESHOLD, VELOCITY_LIMIT, VELOCITY_WINDOW_SECONDS
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "synthetic"
 RESULTS = ROOT / "results"
+CLEAN_TABLE = "payments_clean"  # flags live here since the clean step (sql/clean.sql)
 
 # Rule setups to compare: name -> the rules allowed to flag a payment.
 SETUPS = {
@@ -68,7 +70,7 @@ def load_amounts(path: Path) -> dict[str, float]:
 def load_stored(conn) -> dict[str, tuple[str, str | None, float]]:
     """payment_id -> (status, reason, amount) for every stored payment."""
     with conn.cursor() as cur:
-        cur.execute("SELECT payment_id, status, reason, amount FROM transactions")
+        cur.execute(f"SELECT payment_id, status, reason, amount FROM {CLEAN_TABLE}")
         return {pid: (status, reason, float(amount)) for pid, status, reason, amount in cur}
 
 
@@ -79,7 +81,7 @@ def load_rule_inputs(conn) -> list[tuple[str, str, datetime, float]]:
     velocity window, exactly as it does in the consumer.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT payment_id, account_id, event_time, amount FROM transactions")
+        cur.execute(f"SELECT payment_id, account_id, event_time, amount FROM {CLEAN_TABLE}")
         return [(pid, acct, t, float(amount)) for pid, acct, t, amount in cur]
 
 

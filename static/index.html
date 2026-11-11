@@ -130,6 +130,10 @@
     const data = Object.fromEntries(new FormData(e.target));
     data.amount = Number(data.amount);
     if (!data.location) delete data.location;
+    // The API publishes records as sent, so the form supplies the ID, time and currency.
+    data.payment_id = "pay_" + crypto.randomUUID().replaceAll("-", "");
+    data.timestamp = new Date().toISOString();
+    data.currency = "USD";
     try {
       const res = await fetch("/transactions", {
         method: "POST",
@@ -138,7 +142,7 @@
       });
       const body = await res.json();
       $("msg").textContent = res.ok
-        ? `Submitted ${money.format(data.amount)} — it will appear once the consumer processes it.`
+        ? `Submitted ${money.format(data.amount)} — it will appear after the next clean step (python -m app.clean).`
         : `Error: ${typeof body.detail === "string" ? body.detail : "invalid input"}`;
     } catch (err) {
       $("msg").textContent = "Error: " + err.message;

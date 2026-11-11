@@ -2,21 +2,21 @@ import json
 import logging
 import os
 import threading
-import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from typing import Annotated, Any
 
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from kafka import KafkaConsumer, KafkaProducer
-from pydantic import BaseModel, Field, field_validator
 
 log = logging.getLogger("pipeline")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
 DB_USER = os.getenv("DB_USER", "fintech")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "fintech")
 DB_NAME = os.getenv("DB_NAME", "transactions_db")
@@ -45,40 +45,6 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _new_payment_id() -> str:
-    return f"pay_{uuid.uuid4().hex}"
-
-
-class Transaction(BaseModel):
-    """What POST /transactions accepts. payment_id and timestamp are filled in
-    when the caller leaves them out (e.g. the dashboard form)."""
-
-    payment_id: str = Field(default_factory=_new_payment_id, min_length=1, examples=["pay_00000001"])
-    account_id: str = Field(..., min_length=1, examples=["ACC00012"])
-    merchant_id: str | None = Field(default=None, examples=["M0042"])
-    merchant: str | None = Field(default=None, examples=["Amazon"])
-    amount: float = Field(..., gt=0, examples=[49.99])
-    currency: str = Field(default="USD", examples=["USD"])
-    timestamp: datetime = Field(default_factory=_utcnow, examples=["2026-10-01T12:00:00Z"])
-    country: str | None = Field(default=None, examples=["US"])
-    channel: str | None = Field(default=None, examples=["online"])
-    location: str = Field(default="unknown", examples=["Tucson, AZ"])
-
-    @field_validator("timestamp")
-    @classmethod
-    def assume_utc(cls, value: datetime) -> datetime:
-        """A timestamp without a timezone is taken to be UTC."""
-        return value if value.tzinfo else value.replace(tzinfo=UTC)
-
-
-class PaymentEvent(Transaction):
-    """What the consumer accepts off Kafka: the same fields, but the ID and the
-    time must already be set (the API always sets them before publishing)."""
-
-    payment_id: str = Field(..., min_length=1)
-    timestamp: datetime
-
-
 # --- shared connections ------------------------------------------------------
 
 _producer: KafkaProducer | None = None
@@ -88,7 +54,7 @@ _api_conn_lock = threading.Lock()
 
 
 def get_db_connection():
-    return psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, dbname=DB_NAME)
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, dbname=DB_NAME)
 
 
 def get_producer() -> KafkaProducer:
@@ -142,85 +108,51 @@ def _close_quietly(conn) -> None:
 
 
 def classify(amount: float) -> str:
-    """Rule 1 (amount). The velocity rule needs the account's history, so it
-    runs in SQL; see VELOCITY_SQL."""
+    """Rule 1 (amount), as a Python reference. Both rules run in sql/clean.sql
+    on payments_clean, with these same thresholds (app/clean.py passes them)."""
     return "flagged" if amount > FLAG_THRESHOLD else "cleared"
 
 
-# Experiment only (scripts/kill_test.py --runs ... plain-insert run): with
-# DEDUP_DISABLED=1 the consumer uses a plain INSERT into transactions_nodedup,
-# a copy of the table with no primary key, to show what duplicate protection
-# prevents. Never set it in normal operation.
+# Experiment only (scripts/kill_test.py plain-INSERT run): with DEDUP_DISABLED=1
+# the consumer uses a plain INSERT into raw_payments_nodedup, a copy of the raw
+# table without the (partition, offset) unique key, to show what re-delivery
+# protection prevents. Never set it in normal operation.
 DEDUP_DISABLED = os.getenv("DEDUP_DISABLED") == "1"
-TABLE = "transactions_nodedup" if DEDUP_DISABLED else "transactions"
+RAW_TABLE = "raw_payments_nodedup" if DEDUP_DISABLED else "raw_payments"
 
-INSERT_SQL = f"""
-INSERT INTO {TABLE} (payment_id, account_id, merchant_id, merchant, amount, currency,
-                          country, channel, location, event_time, status, reason)
-VALUES (%(payment_id)s, %(account_id)s, %(merchant_id)s, %(merchant)s, %(amount)s, %(currency)s,
-        %(country)s, %(channel)s, %(location)s, %(event_time)s, %(status)s, %(reason)s)
-{"" if DEDUP_DISABLED else "ON CONFLICT (payment_id) DO NOTHING"}
-RETURNING payment_id
-"""
-
-# Rule 2 (velocity), by each payment's own event_time, not arrival order:
-# a payment is flagged when it is the 7th-or-later payment from its account in
-# the window [event_time - 180s, event_time]. Payments with the same event_time
-# are ordered by payment_id, so "7th" is well defined.
-#
-# It checks the new payment AND the account's later payments within 180s,
-# because a late-arriving payment can push an already-stored later payment over
-# the limit. Adding payments only ever raises counts, so nothing needs un-flagging.
-VELOCITY_SQL = f"""
-UPDATE {TABLE} AS t
-SET status = 'flagged', reason = 'velocity'
-WHERE t.account_id = %(account_id)s
-  AND t.status = 'cleared'
-  AND (t.event_time, t.payment_id) >= (%(event_time)s, %(payment_id)s)
-  AND t.event_time <= %(event_time)s + make_interval(secs => %(window)s)
-  AND (
-      SELECT count(*)
-      FROM {TABLE} AS w
-      WHERE w.account_id = t.account_id
-        AND w.event_time >= t.event_time - make_interval(secs => %(window)s)
-        AND (w.event_time, w.payment_id) <= (t.event_time, t.payment_id)
-  ) >= %(limit)s
-RETURNING t.payment_id
+# The raw layer: every record exactly as received, plus where it came from.
+# A Kafka re-delivery has the same partition and offset, so it is stored once.
+RAW_INSERT_SQL = f"""
+INSERT INTO {RAW_TABLE} (payload, kafka_partition, kafka_offset)
+VALUES (%(payload)s::jsonb, %(partition)s, %(offset)s)
+{"" if DEDUP_DISABLED else "ON CONFLICT (kafka_partition, kafka_offset) DO NOTHING"}
+RETURNING raw_id
 """
 
 
-def store_payment(conn, event: PaymentEvent) -> str:
-    """Insert one payment and apply both rules in a single DB transaction.
+def parse_record(raw: bytes) -> dict:
+    """The message body as a JSON object; ValueError (not JSON) or TypeError (not an object) otherwise."""
+    record = json.loads(raw.decode("utf-8"))  # UnicodeDecodeError / JSONDecodeError are ValueErrors
+    if not isinstance(record, dict):
+        raise TypeError(f"expected a JSON object, got {type(record).__name__}")
+    return record
 
-    Returns 'duplicate' if the payment_id was already stored (nothing changes),
-    otherwise the new payment's status: 'flagged' or 'cleared'.
-    """
-    status = classify(event.amount)
-    row = {
-        **event.model_dump(exclude={"timestamp"}),
-        "event_time": event.timestamp,
-        "status": status,
-        "reason": "amount" if status == "flagged" else None,
-    }
+
+def store_raw(conn, raw: bytes, partition: int, offset: int) -> str:
+    """Store one message in the raw layer: 'stored', or 'duplicate' for a
+    Kafka re-delivery of a message that is already there."""
+    record = parse_record(raw)
     with conn.cursor() as cur:
-        cur.execute(INSERT_SQL, row)
+        cur.execute(
+            RAW_INSERT_SQL,
+            {"payload": json.dumps(record, allow_nan=False), "partition": partition, "offset": offset},
+        )
         if cur.fetchone() is None:
             conn.rollback()
-            log.info("duplicate ignored: %s", event.payment_id)
+            log.info("duplicate ignored: %s (%s/%s@%s)", record.get("payment_id"), TOPIC_NAME, partition, offset)
             return "duplicate"
-        cur.execute(
-            VELOCITY_SQL,
-            {
-                "account_id": event.account_id,
-                "event_time": event.timestamp,
-                "payment_id": event.payment_id,
-                "window": VELOCITY_WINDOW_SECONDS,
-                "limit": VELOCITY_LIMIT,
-            },
-        )
-        newly_flagged = {r[0] for r in cur.fetchall()}
     conn.commit()
-    return "flagged" if event.payment_id in newly_flagged else status
+    return "stored"
 
 
 def send_to_dead_letter(raw: bytes, error: Exception, source: str) -> None:
@@ -235,22 +167,24 @@ def send_to_dead_letter(raw: bytes, error: Exception, source: str) -> None:
     get_producer().send(DEAD_LETTER_TOPIC, value=payload).get(timeout=10)
 
 
-def process_message(conn, raw: bytes, source: str = "") -> str:
-    """Handle one Kafka message: 'flagged', 'cleared', 'duplicate' or 'dead_letter'.
+def process_message(conn, raw: bytes, partition: int, offset: int) -> str:
+    """Handle one Kafka message: 'stored', 'duplicate' or 'dead_letter'.
 
-    A record that cannot be parsed or stored goes to the dead-letter topic and
-    processing carries on. A lost DB connection is re-raised instead, so the
-    caller can reconnect and retry: that is not the record's fault.
+    Amount, timestamp or ID problems are not checked here: the record is stored
+    raw and sql/clean.sql fixes or quarantines it. Only a message that is not a
+    JSON object at all (or that Postgres refuses as JSONB) goes to the
+    dead-letter topic, and processing carries on. A lost DB connection is
+    re-raised instead, so the caller can reconnect and retry.
     """
+    source = f"{TOPIC_NAME}/{partition}@{offset}"
     try:
-        event = PaymentEvent.model_validate_json(raw)
-        return store_payment(conn, event)
+        return store_raw(conn, raw, partition, offset)
     except DB_CONNECTION_ERRORS:
         raise
     except Exception as exc:  # noqa: BLE001 - any other failure means a bad record
         conn.rollback()  # leave the connection usable for the next record
         send_to_dead_letter(raw, exc, source)
-        log.warning("dead-lettered %s: %s: %s", source or "record", type(exc).__name__, exc)
+        log.warning("dead-lettered %s: %s: %s", source, type(exc).__name__, exc)
         return "dead_letter"
 
 
@@ -267,7 +201,7 @@ def make_consumer(stop: threading.Event) -> KafkaConsumer | None:
                 group_id=CONSUMER_GROUP,
                 # Offsets are committed by hand, only after a batch is fully
                 # stored or dead-lettered, so a crash re-delivers instead of
-                # losing. Re-delivered payments are absorbed by ON CONFLICT.
+                # losing. Re-delivered messages are absorbed by ON CONFLICT.
                 enable_auto_commit=False,
             )
         except Exception as exc:  # noqa: BLE001 - Kafka may still be starting up
@@ -284,7 +218,7 @@ def _process_with_retry(conn, msg, stop: threading.Event):
         try:
             if conn is None or conn.closed:
                 conn = get_db_connection()
-            outcome = process_message(conn, msg.value, source)
+            outcome = process_message(conn, msg.value, msg.partition, msg.offset)
             log.debug("%s -> %s", source, outcome)
             return conn, True
         except Exception as exc:  # noqa: BLE001 - never drop a message; wait and retry
@@ -297,8 +231,8 @@ def _process_with_retry(conn, msg, stop: threading.Event):
 
 
 def consume_loop(stop: threading.Event) -> None:
-    """Runs in a background thread: reads payments off Kafka, applies the fraud
-    rules and stores the result in Postgres, using one DB connection."""
+    """Runs in a background thread: reads payments off Kafka and stores each one
+    as received in raw_payments, using one DB connection."""
     consumer = make_consumer(stop)
     if consumer is None:
         return
@@ -361,15 +295,22 @@ def dashboard():
 
 
 @app.post("/transactions", status_code=202)
-def create_transaction(txn: Transaction):
-    """Publishes a payment event to Kafka and waits for Kafka to confirm it.
-    Does NOT write to the DB -- the consumer does that asynchronously."""
-    record = txn.model_dump(mode="json")
+def create_transaction(record: Annotated[dict[str, Any], Body()]):
+    """Publishes the record to Kafka, as sent, and waits for Kafka to confirm.
+
+    Any JSON object is accepted: amount, timestamp and ID problems are fixed or
+    quarantined later by the clean step (sql/clean.sql). Only a body that is not
+    a JSON object at all is rejected (422). Does NOT write to the DB.
+    """
     try:
-        # Keyed by account, so one account's payments stay in order on one partition.
-        get_producer().send(
-            TOPIC_NAME, key=txn.account_id.encode("utf-8"), value=record
-        ).get(timeout=10)
+        json.dumps(record, allow_nan=False)
+    except ValueError:  # NaN / Infinity are not JSON
+        raise HTTPException(status_code=422, detail="body is not valid JSON (NaN or Infinity)")
+    account = record.get("account_id")
+    # Keyed by the normalized account, so one account's payments stay in order on one partition.
+    key = account.strip().upper().encode("utf-8") if isinstance(account, str) else None
+    try:
+        get_producer().send(TOPIC_NAME, key=key, value=record).get(timeout=10)
     except Exception as exc:  # noqa: BLE001 - any producer failure -> 503
         raise HTTPException(status_code=503, detail=f"Kafka unavailable: {exc}")
     return {"status": "submitted", "transaction": record}
@@ -377,7 +318,8 @@ def create_transaction(txn: Transaction):
 
 @app.get("/transactions")
 def list_transactions(status: str | None = None):
-    select = f"SELECT {', '.join(COLUMNS)} FROM transactions"
+    """The latest cleaned payments (payments_clean, built by the clean step)."""
+    select = f"SELECT {', '.join(COLUMNS)} FROM payments_clean"
     order = " ORDER BY event_time DESC, payment_id DESC LIMIT 100"
     try:
         if status:

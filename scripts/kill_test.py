@@ -1,5 +1,5 @@
 """Crash test: kill the consumer during a replay, restart it, and check that no
-accepted payment was lost or stored twice. Repeated at several kill points,
+accepted record was lost from, or stored twice in, the raw layer (raw_payments). Repeated at several kill points,
 then once more with duplicate protection off to show what it prevents.
 
     python -m scripts.kill_test [--limit 6000] [--kill-at 0.25,0.5,0.75] [--no-plain-run]
@@ -15,7 +15,8 @@ re-delivery: messages it had stored but not yet committed when it was killed.
 The consumer logs each one ("duplicate ignored: <payment_id>").
 
 The plain-INSERT run recreates the consumer with DEDUP_DISABLED=1: plain INSERT
-into transactions_nodedup (no primary key), then puts the normal consumer back.
+into raw_payments_nodedup (no (partition, offset) unique key), then puts the
+normal consumer back.
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ from scripts.replay import (
 from scripts.score import db_connect
 
 DEAD_LETTER_TOPIC = "payments.dead-letter"
-NODEDUP_TABLE = "transactions_nodedup"
+RAW_TABLE = "raw_payments"
+NODEDUP_TABLE = "raw_payments_nodedup"
+PID = "payload ->> 'payment_id'"
 
 
 def compose(*args: str, check: bool = True, env: dict | None = None) -> str:
@@ -74,20 +77,20 @@ def drop_resends(records: list[dict]) -> list[dict]:
     return out
 
 
-def stored_counts(conn, tag: str, table: str = "transactions") -> tuple[int, int]:
+def stored_counts(conn, tag: str, table: str = RAW_TABLE) -> tuple[int, int]:
     """(rows, distinct payment_ids) stored for this run."""
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT count(*), count(DISTINCT payment_id) FROM {table} WHERE payment_id LIKE %s",
+            f"SELECT count(*), count(DISTINCT {PID}) FROM {table} WHERE {PID} LIKE %s",
             (f"{tag}\\_%",),
         )
         rows, distinct = cur.fetchone()
     return rows, distinct
 
 
-def stored_ids(conn, tag: str, table: str = "transactions") -> set[str]:
+def stored_ids(conn, tag: str, table: str = RAW_TABLE) -> set[str]:
     with conn.cursor() as cur:
-        cur.execute(f"SELECT payment_id FROM {table} WHERE payment_id LIKE %s", (f"{tag}\\_%",))
+        cur.execute(f"SELECT {PID} FROM {table} WHERE {PID} LIKE %s", (f"{tag}\\_%",))
         return {r[0] for r in cur}
 
 
@@ -134,7 +137,7 @@ def wait_for_consumer_running() -> None:
 
 
 def run_once(args, base_records: list[dict], kill_at: float, dedup: bool) -> dict:
-    table = "transactions" if dedup else NODEDUP_TABLE
+    table = RAW_TABLE if dedup else NODEDUP_TABLE
     tag = f"kt{uuid.uuid4().hex[:8]}"
     records = [tag_record(r, tag) for r in base_records]
     kill_after = int(len(records) * kill_at)
@@ -219,14 +222,15 @@ def ensure_nodedup_table() -> None:
     conn = db_connect()
     try:
         with conn.cursor() as cur:
-            # LIKE copies columns, NOT NULLs and defaults, but no primary key or indexes.
-            cur.execute(f"CREATE TABLE IF NOT EXISTS {NODEDUP_TABLE} (LIKE transactions INCLUDING DEFAULTS)")
-            # Same non-unique index as transactions, so the velocity query stays fast;
-            # being non-unique, it does not stop duplicates.
+            # LIKE copies columns, NOT NULLs and defaults, but no unique keys or indexes.
+            cur.execute(f"CREATE TABLE IF NOT EXISTS {NODEDUP_TABLE} (LIKE {RAW_TABLE} INCLUDING DEFAULTS)")
+            # Non-unique, so duplicates still go in; it only keeps the per-run
+            # counts (WHERE payment_id LIKE 'tag\_%') from scanning the whole table.
             cur.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_nodedup_account_time "
-                f"ON {NODEDUP_TABLE} (account_id, event_time, payment_id)"
+                f"CREATE INDEX IF NOT EXISTS {NODEDUP_TABLE}_payment_id ON {NODEDUP_TABLE} "
+                f"(({PID}) text_pattern_ops)"
             )
+        conn.commit()
     finally:
         conn.close()
 
@@ -256,7 +260,7 @@ def main() -> None:
 
     if not args.no_plain_run:
         ensure_nodedup_table()
-        print("recreating the consumer with DEDUP_DISABLED=1 (plain INSERT into transactions_nodedup)")
+        print("recreating the consumer with DEDUP_DISABLED=1 (plain INSERT into raw_payments_nodedup)")
         compose("up", "-d", "consumer", env={"DEDUP_DISABLED": "1"})
         wait_for_consumer_running()
         try:
