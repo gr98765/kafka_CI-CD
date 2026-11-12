@@ -76,12 +76,19 @@ python -m scripts.replay        # POST data/synthetic/payments_raw.jsonl (mess i
 DB_PORT=5433 python -m app.clean
 python -m scripts.clean_score   # cleaning vs. mess_log.csv, accounting, rules comparison
 python -m scripts.score         # rules comparison + velocity thresholds -> results/rules_comparison.md
+python -m scripts.train_model   # models vs. rules on days 26-30 -> results/model_comparison.md
 ```
+
+`scripts/train_model.py` (needs `pip install -r requirements-dev.txt`) builds features from
+`payments_clean` using only each account's earlier payments, trains logistic regression and gradient
+boosting on days 1-21, picks each threshold on days 22-25 so its false alarms per legit payment match
+the rules' on the test window, and scores days 26-30. The model with the best validation average
+precision is saved to `models/fraud_model.joblib` (git-ignored; re-run the script to recreate it).
 
 ## Running tests
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt + scikit-learn for the model tests
 DISABLE_KAFKA_CONSUMER=1 pytest -v
 ```
 

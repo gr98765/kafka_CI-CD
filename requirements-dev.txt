@@ -1,0 +1,5 @@
+# Everything for tests and the offline model work (scripts/train_model.py).
+# The API/consumer image installs requirements.txt only.
+-r requirements.txt
+scikit-learn==1.9.1
+joblib==1.6.0
