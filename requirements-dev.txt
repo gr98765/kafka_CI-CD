@@ -1,5 +1,7 @@
-# Everything for tests and the offline model work (scripts/train_model.py).
+# Everything for tests, the offline model work (scripts/train_model.py) and the
+# load test (scripts/locustfile.py).
 # The API/consumer image installs requirements.txt only.
 -r requirements.txt
 scikit-learn==1.9.1
 joblib==1.6.0
+locust==2.47.0

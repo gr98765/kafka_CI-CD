@@ -1,0 +1,3 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+POST,POST /transactions,HTTP 503,2,1794470916.1,1794470990.4
+POST,POST /transactions,"ConnectionResetError(10054, 'reset')",1,1794470950.0,1794470950.0
