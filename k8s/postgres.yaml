@@ -1,0 +1,67 @@
+# A single Postgres for the CI cluster only: one copy, small memory settings,
+# no persistent disk (data vanishes with the pod). On first start it runs
+# db-init-script.sql, which CI loads into the "db-init" ConfigMap:
+#   kubectl create configmap db-init --from-file=init.sql=db-init-script.sql
+# Pods reach it at postgres:5432; the NodePort lets the test script on the
+# GitHub runner read the tables (see .github/kind-config.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels: {app: postgres}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=40"]
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom: {configMapKeyRef: {name: pipeline-config, key: DB_NAME}}
+            - name: POSTGRES_USER
+              valueFrom: {configMapKeyRef: {name: pipeline-config, key: DB_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {configMapKeyRef: {name: pipeline-config, key: DB_PASSWORD}}
+          volumeMounts:
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          resources:
+            requests: {cpu: 250m, memory: 128Mi}
+            limits: {cpu: "1", memory: 384Mi}
+          # -h 127.0.0.1: during first-start setup Postgres listens only on a
+          # local socket, so this stays "not ready" until setup has finished.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "fintech", "-d", "transactions_db"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "fintech", "-d", "transactions_db"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+      volumes:
+        - name: init
+          configMap: {name: db-init}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  type: NodePort
+  selector: {app: postgres}
+  ports:
+    - port: 5432
+      targetPort: 5432
+      nodePort: 30432  # -> localhost:5432 on the runner

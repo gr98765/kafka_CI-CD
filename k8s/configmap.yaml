@@ -1,0 +1,22 @@
+# Settings shared by every pod: where Kafka and Postgres are (their Service
+# names inside the cluster), the topic name and partition count, and the fraud
+# rule thresholds. The API and the consumer read these as environment variables.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TOPIC: transactions
+  TOPIC_PARTITIONS: "3"
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: transactions_db
+  DB_USER: fintech
+  # Throwaway CI credentials, same as docker-compose.yml. A real cluster would
+  # keep this in a Secret.
+  DB_PASSWORD: fintech
+  # Fraud rules (same values as the defaults in app/main.py)
+  FLAG_THRESHOLD: "1000.00"
+  VELOCITY_LIMIT: "7"
+  VELOCITY_WINDOW_SECONDS: "180"

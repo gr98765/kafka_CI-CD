@@ -44,6 +44,11 @@ jobs:
           pip install ruff==0.17.4
           ruff check .
 
+      - name: Validate Kubernetes manifests (no cluster needed)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          ./kubeconform -strict -summary k8s/
+
       - name: Run tests
         env:
           DISABLE_KAFKA_CONSUMER: 1
@@ -55,3 +60,78 @@ jobs:
       - name: Build Docker image
         run: |
           docker build -t kafka-cicd-app .
+
+  # The pipeline on a throwaway one-node kind cluster on this runner: Kafka,
+  # Postgres, the API and the consumer all as pods (k8s/). Separate job so
+  # build-test stays fast.
+  k8s-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432  # Postgres NodePort, mapped by .github/kind-config.yaml
+      K8S_API: http://localhost:8080
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: fintech
+          config: .github/kind-config.yaml
+
+      - name: Build the image and load it into kind
+        run: |
+          docker build -t fintech-pipeline:ci .
+          kind load docker-image fintech-pipeline:ci --name fintech
+
+      - name: Start Kafka and Postgres
+        run: |
+          kubectl apply -f k8s/configmap.yaml
+          kubectl create configmap db-init --from-file=init.sql=db-init-script.sql
+          kubectl apply -f k8s/kafka.yaml -f k8s/postgres.yaml
+          kubectl rollout status deployment/kafka --timeout=300s
+          kubectl rollout status deployment/postgres --timeout=300s
+
+      - name: Create the topic (3 partitions)
+        run: |
+          kubectl apply -f k8s/topic-job.yaml
+          kubectl wait --for=condition=complete job/create-topics --timeout=300s
+          kubectl logs job/create-topics
+
+      - name: Start the API and the consumer
+        run: |
+          kubectl apply -f k8s/api.yaml -f k8s/consumer.yaml
+          kubectl rollout status deployment/api --timeout=300s
+          kubectl rollout status deployment/consumer --timeout=300s
+          kubectl get pods -o wide
+
+      - name: Smoke, backlog and recovery tests
+        run: python -m scripts.k8s_smoke --smoke 500 --payments 10000 --replicas 1,3
+
+      - name: Show pods that are not ready
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl get events --sort-by=.lastTimestamp | tail -n 40 || true
+          # READY column "x/y" with x < y, ignoring the finished topic Job pod
+          for pod in $(kubectl get pods --no-headers | awk '{split($2, r, "/"); if (r[1] != r[2] && $3 != "Completed") print $1}'); do
+            echo "::group::$pod"
+            kubectl describe pod "$pod"
+            kubectl logs "$pod" --all-containers --tail=200 || true
+            kubectl logs "$pod" --all-containers --previous --tail=200 || true
+            echo "::endgroup::"
+          done
+          echo "::group::recent API and consumer logs"
+          kubectl logs deployment/api --tail=50 || true
+          kubectl logs -l app=consumer --prefix --tail=50 || true
+          echo "::endgroup::"
