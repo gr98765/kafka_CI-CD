@@ -85,6 +85,24 @@ boosting on days 1-21, picks each threshold on days 22-25 so its false alarms pe
 the rules' on the test window, and scores days 26-30. The model with the best validation average
 precision is saved to `models/fraud_model.joblib` (git-ignored; re-run the script to recreate it).
 
+### Larger evaluation (3 seeds, ~550K payments each)
+
+```bash
+python -m generator.generate --out data/large    --accounts 5000 --days 60 --seed 1   # also large_s2/s3, seeds 2/3
+python -m scripts.larger_eval load --seed 1        # COPY into schema eval_s1 (dropped and recreated)
+python -m scripts.larger_eval evaluate --seed 1    # one process per seed -> results/larger_eval/seed1.json
+python -m scripts.larger_eval sql-speed --seed 1   # velocity + daily summary, before/after an index
+python -m scripts.larger_eval report               # all seeds -> results/larger_eval.md
+```
+
+Each seed gets its own schema (`eval_s1`..`eval_s3`), bulk-loaded with COPY from the generator's clean
+file, so the app's tables are untouched. Split by day: train 1-36, validation 37-46, test 47-60. It
+compares the fixed rules, hand-tuned rules (velocity limit 5, plus 5+ payments under $5 in 3 minutes),
+logistic regression and gradient boosting, with each model's threshold set on validation to match the
+fixed rules' validation false alarms. Payments are held as numpy arrays (about 400 MB peak per seed);
+a test checks the array version gives the same recall, precision and false alarms as the
+one-object-per-payment version.
+
 ## Running tests
 
 ```bash

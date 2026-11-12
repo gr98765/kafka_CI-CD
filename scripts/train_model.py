@@ -66,7 +66,7 @@ SEED = 0
 NUMERIC = ["amount", "n_prev_3m", "n_prev_1h", "amount_to_avg", "secs_since_prev"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Payment:
     payment_id: str
     account_id: str
@@ -89,45 +89,40 @@ def build_features(
     for i, p in enumerate(ordered):
         by_account[p.account_id].append(i)
 
-    n_prev_3m = np.zeros(len(ordered))
-    n_prev_1h = np.zeros(len(ordered))
-    to_avg = np.ones(len(ordered))
-    since_prev = np.full(len(ordered), FIRST_GAP)
+    # Filled column by column straight into one array (no per-row lists), so
+    # 500K+ payments fit comfortably in memory.
+    names = feature_names(channels)
+    col = {n: j for j, n in enumerate(names)}
+    X = np.zeros((len(ordered), len(names)))
+    X[:, col["amount_to_avg"]] = 1.0
+    X[:, col["secs_since_prev"]] = FIRST_GAP
+    for i, p in enumerate(ordered):
+        X[i, col["amount"]] = p.amount
+        X[i, col["hour"]] = p.event_time.astimezone(UTC).hour
+        if p.channel in channels:
+            X[i, col[f"channel_{p.channel}"]] = 1.0
+        X[i, col["foreign"]] = 1.0 if p.country != home.get(p.account_id) else 0.0
+
     for idx in by_account.values():
         ts = [ordered[i].event_time.timestamp() for i in idx]
         total = 0.0
         for k, i in enumerate(idx):
-            n_prev_3m[i] = k - bisect_left(ts, ts[k] - 180, 0, k)
-            n_prev_1h[i] = k - bisect_left(ts, ts[k] - 3600, 0, k)
+            X[i, col["n_prev_3m"]] = k - bisect_left(ts, ts[k] - 180, 0, k)
+            X[i, col["n_prev_1h"]] = k - bisect_left(ts, ts[k] - 3600, 0, k)
             if k:
                 avg = total / k
-                to_avg[i] = ordered[i].amount / avg if avg > 0 else 1.0
-                since_prev[i] = ts[k] - ts[k - 1]
+                X[i, col["amount_to_avg"]] = ordered[i].amount / avg if avg > 0 else 1.0
+                X[i, col["secs_since_prev"]] = ts[k] - ts[k - 1]
             total += ordered[i].amount
-
-    rows = []
-    for i, p in enumerate(ordered):
-        rows.append(
-            [
-                p.amount,
-                p.event_time.astimezone(UTC).hour,
-                *(1.0 if p.channel == c else 0.0 for c in channels),
-                1.0 if p.country != home.get(p.account_id) else 0.0,
-                n_prev_3m[i],
-                n_prev_1h[i],
-                to_avg[i],
-                since_prev[i],
-            ]
-        )
-    return [p.payment_id for p in ordered], np.array(rows, dtype=float)
+    return [p.payment_id for p in ordered], X
 
 
 def day_of(ts: datetime) -> int:
     return (ts.astimezone(UTC).date() - START).days + 1
 
 
-def window_of(day: int) -> str | None:
-    for name, (first, last) in WINDOWS.items():
+def window_of(day: int, windows: dict[str, tuple[int, int]] = WINDOWS) -> str | None:
+    for name, (first, last) in windows.items():
         if first <= day <= last:
             return name
     return None
