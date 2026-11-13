@@ -9,7 +9,13 @@ import pytest
 
 from app import main
 from app.healthcheck import check
-from scripts.k8s_smoke import catch_up_seconds, failures, make_records, total_lag
+from scripts.k8s_smoke import (
+    catch_up_seconds,
+    failures,
+    make_records,
+    total_lag,
+    wait_for_api,
+)
 
 K8S = Path(__file__).resolve().parent.parent / "k8s"
 yaml = pytest.importorskip("yaml")  # PyYAML comes with uvicorn[standard]
@@ -105,6 +111,13 @@ def test_failures_flag_lost_payments_and_an_incomplete_smoke():
     assert failures({**ok, "stored": 499, "lost": 1}, [], None)[0].startswith("smoke")
     assert failures(ok, [{"replicas": 3, "lost": 2}], {"lost": 1}) == [
         "backlog with 3 replica(s): lost 2", "recovery: lost 1"]  # fmt: skip
+
+
+def test_api_wait_error_points_at_the_port_forward_not_docker_compose():
+    with pytest.raises(SystemExit) as exc:
+        wait_for_api("http://127.0.0.1:9", seconds=0.1)  # port 9: nothing listens
+    assert "kubectl port-forward svc/api" in str(exc.value)
+    assert "docker compose" not in str(exc.value)
 
 
 # --- manifests ------------------------------------------------------------------------

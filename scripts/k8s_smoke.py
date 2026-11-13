@@ -3,8 +3,10 @@
 
     python -m scripts.k8s_smoke [--smoke 500] [--payments 10000] [--replicas 1,3]
 
-Needs kubectl pointed at the cluster, the API at localhost:8080 and Postgres at
-localhost:5432 (NodePorts mapped by .github/kind-config.yaml).
+Needs kubectl pointed at the cluster, and `kubectl port-forward` running for the
+API (svc/api -> localhost:8080) and Postgres (svc/postgres -> localhost:5432).
+The CI job starts both and restarts them if they drop; database reads here
+reconnect if that happens mid-run, and the HTTP sender retries.
 
 1. Smoke: with 1 consumer running, POST --smoke payments and wait until they are
    all in raw_payments. Prints sent, stored, lost, duplicated.
@@ -32,11 +34,13 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 
+import httpx
 import psycopg2
 
-from scripts.replay import check_api, post_all, summarize
+from scripts.replay import post_all, summarize
 
 API = os.getenv("K8S_API", "http://localhost:8080")
 PAYMENT_TABLES = ("raw_payments", "payments_clean", "payments_quarantine")
@@ -154,34 +158,75 @@ def kafka_lag() -> int | None:
     return total_lag(out)
 
 
-def db_connect():
-    conn = psycopg2.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-        user=os.getenv("DB_USER", "fintech"),
-        password=os.getenv("DB_PASSWORD", "fintech"),
-        dbname=os.getenv("DB_NAME", "transactions_db"),
-    )
-    conn.autocommit = True
-    return conn
+def wait_for_api(api: str, seconds: float = 60) -> None:
+    """Poll {api}/health until it answers 200, or exit with a Kubernetes-specific hint."""
+    deadline, error = time.monotonic() + seconds, None
+    while time.monotonic() < deadline:
+        try:
+            httpx.get(f"{api}/health", timeout=5).raise_for_status()
+            return
+        except httpx.HTTPError as exc:
+            error = exc
+            time.sleep(2)
+    sys.exit(f"API not reachable at {api} after {seconds:.0f}s ({error}). Is `kubectl port-forward svc/api "
+             "8080:8000` running, and is the api pod Ready (kubectl get pods -l app=api)?")  # fmt: skip
 
 
-def reset_tables(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {', '.join(PAYMENT_TABLES)} RESTART IDENTITY")
+class Db:
+    """Autocommit Postgres connection that reconnects (a few times) if the
+    port-forward restarts under it. Every query here is a read or an idempotent
+    TRUNCATE, so running one again is safe."""
+
+    def __init__(self, attempts: int = 5) -> None:
+        self.attempts = attempts
+        self.conn = None
+
+    def _connect(self) -> None:
+        self.conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", "5432"),
+            user=os.getenv("DB_USER", "fintech"),
+            password=os.getenv("DB_PASSWORD", "fintech"),
+            dbname=os.getenv("DB_NAME", "transactions_db"),
+            connect_timeout=5,
+        )
+        self.conn.autocommit = True
+
+    def query(self, sql: str, params: tuple = (), fetch: bool = True) -> list[tuple]:
+        for attempt in range(1, self.attempts + 1):
+            try:
+                if self.conn is None or self.conn.closed:
+                    self._connect()
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    return cur.fetchall() if fetch else []
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                if attempt == self.attempts:
+                    raise
+                print(f"  database connection lost ({type(exc).__name__}); reconnecting")
+                self.close()
+                time.sleep(2)
+        return []
+
+    def close(self) -> None:
+        if self.conn is not None:
+            with suppress(psycopg2.Error):
+                self.conn.close()
+            self.conn = None
 
 
-def stored(conn, tag: str) -> tuple[int, int]:
+def reset_tables(db: Db) -> None:
+    db.query(f"TRUNCATE {', '.join(PAYMENT_TABLES)} RESTART IDENTITY", fetch=False)
+
+
+def stored(db: Db, tag: str) -> tuple[int, int]:
     """(rows, distinct payment_ids) for this run."""
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT count(*), count(DISTINCT {PID}) FROM raw_payments WHERE {PID} LIKE %s", (f"{tag}\\_%",))
-        return cur.fetchone()
+    [row] = db.query(f"SELECT count(*), count(DISTINCT {PID}) FROM raw_payments WHERE {PID} LIKE %s", (f"{tag}\\_%",))
+    return row
 
 
-def stored_ids(conn, tag: str) -> set[str]:
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT {PID} FROM raw_payments WHERE {PID} LIKE %s", (f"{tag}\\_%",))
-        return {r[0] for r in cur}
+def stored_ids(db: Db, tag: str) -> set[str]:
+    return {r[0] for r in db.query(f"SELECT {PID} FROM raw_payments WHERE {PID} LIKE %s", (f"{tag}\\_%",))}
 
 
 def send(records: list[dict], workers: int) -> tuple[set[str], float, dict]:
@@ -223,7 +268,7 @@ def smoke_run(n: int, workers: int, idle_limit: float) -> dict:
     tag = f"smoke{uuid.uuid4().hex[:6]}"
     print(f"\nSMOKE: {n:,} payments with 1 consumer, tag {tag}")
     scale(1)
-    conn = db_connect()
+    conn = Db()
     try:
         reset_tables(conn)
         accepted, send_s, s = send(make_records(n, tag), workers)
@@ -242,7 +287,7 @@ def backlog_run(n: int, replicas: int, workers: int, idle_limit: float) -> dict:
     tag = f"bl{replicas}r{uuid.uuid4().hex[:6]}"
     print(f"\nBACKLOG: {n:,} payments, then {replicas} consumer replica(s), tag {tag}")
     scale(0)
-    conn = db_connect()
+    conn = Db()
     try:
         reset_tables(conn)
         accepted, send_s, s = send(make_records(n, tag, seed=replicas), workers)
@@ -266,7 +311,7 @@ def recovery_run(n: int, workers: int, idle_limit: float) -> dict:
     tag = f"rec{uuid.uuid4().hex[:6]}"
     print(f"\nRECOVERY: {n:,} payments with 3 replicas, one consumer pod deleted, tag {tag}")
     scale(3)
-    conn = db_connect()
+    conn = Db()
     reset_tables(conn)
     records = make_records(n, tag, seed=99)
     lock, accepted_so_far = threading.Lock(), [0]
@@ -369,7 +414,7 @@ def main() -> None:
     p.add_argument("--skip-recovery", action="store_true")
     args = p.parse_args()
 
-    check_api(API)
+    wait_for_api(API)
     smoke = smoke_run(args.smoke, args.workers, args.idle_limit)
     runs = [backlog_run(args.payments, int(n), args.workers, args.idle_limit) for n in args.replicas.split(",")]
     recovery = None if args.skip_recovery else recovery_run(args.payments, args.workers, args.idle_limit)

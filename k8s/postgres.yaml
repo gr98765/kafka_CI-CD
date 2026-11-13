@@ -2,8 +2,8 @@
 # no persistent disk (data vanishes with the pod). On first start it runs
 # db-init-script.sql, which CI loads into the "db-init" ConfigMap:
 #   kubectl create configmap db-init --from-file=init.sql=db-init-script.sql
-# Pods reach it at postgres:5432; the NodePort lets the test script on the
-# GitHub runner read the tables (see .github/kind-config.yaml).
+# Pods reach it at postgres:5432; the test script on the GitHub runner reads
+# the tables through kubectl port-forward svc/postgres 5432:5432.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -59,9 +59,8 @@ kind: Service
 metadata:
   name: postgres
 spec:
-  type: NodePort
+  type: ClusterIP
   selector: {app: postgres}
   ports:
     - port: 5432
       targetPort: 5432
-      nodePort: 30432  # -> localhost:5432 on the runner
