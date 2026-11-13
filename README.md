@@ -152,8 +152,57 @@ table is not touched while it is on.
 `.github/workflows/ci.yml` runs on every push/PR to `main`:
 1. Installs dependencies
 2. Lints with `ruff`
-3. Runs the pytest suite
-4. Builds the Docker image (proves it packages correctly)
+3. Validates the Kubernetes manifests in `k8s/` with kubeconform (no cluster needed)
+4. Runs the pytest suite
+5. Builds the Docker image (proves it packages correctly)
+
+A second job, `k8s-smoke`, runs the pipeline on Kubernetes (next section).
+
+## Kubernetes (CI only)
+
+The cluster is a **throwaway one-node [kind](https://kind.sigs.k8s.io/) cluster on a GitHub
+Actions runner**, created and deleted by the `k8s-smoke` job on every run. Nothing here is a
+production setup: Kafka and Postgres are single copies with small memory settings and no
+persistent disk. It does not run on the laptop (not enough memory).
+
+```
+ GitHub runner
+ ┌───────────────────────────── kind cluster (1 node) ─────────────────────────────┐
+ │                                                                                  │
+ │  Job create-topics ──(once: "transactions", 3 partitions)──▶ Deployment kafka    │
+ │                                                                  ▲     │         │
+ │  Deployment api (1) ──── POST /transactions ─────────────────────┘     │         │
+ │        ▲                                                               ▼         │
+ │        │                                     Deployment consumer (1, scaled 0-3) │
+ │        │                                                               │         │
+ │        │                                        Deployment postgres ◀──┘         │
+ │        │                                         (raw_payments)  ▲               │
+ └────────┼─────────────────────────────────────────────────────────┼───────────────┘
+   localhost:8080 (NodePort 30080)                      localhost:5432 (NodePort 30432)
+          └──────────────── python -m scripts.k8s_smoke ─────────────┘
+```
+
+| File | What it is |
+|---|---|
+| `k8s/configmap.yaml` | Kafka and Postgres addresses, topic name and partitions, fraud thresholds |
+| `k8s/kafka.yaml`, `k8s/postgres.yaml` | Single-copy Kafka (KRaft, 384 MB heap) and Postgres, CI only |
+| `k8s/topic-job.yaml` | One-off Job that creates the topic with 3 partitions |
+| `k8s/api.yaml` | API Deployment (HTTP probes, limits) and its Service |
+| `k8s/consumer.yaml` | Consumer Deployment; probes check a heartbeat file (`app/healthcheck.py`) |
+| `.github/kind-config.yaml` | The kind cluster, with the two NodePorts mapped to the runner |
+
+The `k8s-smoke` job creates the cluster, builds and loads the image, starts Kafka and Postgres,
+runs the topic Job, starts the API and the consumer, then runs `python -m scripts.k8s_smoke`:
+
+1. **Smoke**: 500 payments with 1 consumer; prints sent / stored / lost / duplicated.
+2. **Backlog**: 10,000 payments sent while the consumer is scaled to 0, then the consumer is
+   scaled to 1 (and, in a second run, to 3); prints the seconds until all are stored. Tables are
+   emptied between runs.
+3. **Recovery**: 3 consumers, 10,000 payments, one consumer pod deleted once a third are stored;
+   prints how long until the backlog is back where it was, plus lost / duplicated.
+
+The job fails if any accepted payment is lost. On failure it prints `kubectl describe` and logs
+for every pod that is not ready. The summary table also appears on the run's summary page.
 
 ## Known gotcha
 

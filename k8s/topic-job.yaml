@@ -1,0 +1,33 @@
+# A one-off Job that creates the payments topic ("transactions", 3 partitions,
+# so up to 3 consumers can share the work) and the dead-letter topic, then
+# prints what Kafka has. Run it after Kafka is ready and before the API and the
+# consumer start. If Kafka is not reachable yet it fails and Kubernetes retries.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-topics
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      containers:
+        - name: create-topics
+          image: apache/kafka:3.7.0
+          envFrom:
+            - configMapRef: {name: pipeline-config}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              T=/opt/kafka/bin/kafka-topics.sh
+              $T --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --create --if-not-exists \
+                 --topic "$KAFKA_TOPIC" --partitions "$TOPIC_PARTITIONS" --replication-factor 1
+              $T --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --create --if-not-exists \
+                 --topic payments.dead-letter --partitions 1 --replication-factor 1
+              $T --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" --describe --topic "$KAFKA_TOPIC" \
+                | tee /dev/stderr | grep -q "PartitionCount: $TOPIC_PARTITIONS"
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}

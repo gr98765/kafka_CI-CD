@@ -20,16 +20,20 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_USER = os.getenv("DB_USER", "fintech")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "fintech")
 DB_NAME = os.getenv("DB_NAME", "transactions_db")
-TOPIC_NAME = "transactions"
+TOPIC_NAME = os.getenv("KAFKA_TOPIC", "transactions")
 DEAD_LETTER_TOPIC = "payments.dead-letter"
 CONSUMER_GROUP = "transaction-consumer-group"
 
 # Fraud rules. Everything is in US dollars; no currency conversion.
-FLAG_THRESHOLD = 1000.00  # rule 1: amount > this -> flagged ('amount')
-VELOCITY_LIMIT = 7  # rule 2: the 7th-or-later payment by one account...
-VELOCITY_WINDOW_SECONDS = 180  # ...within this many seconds -> flagged ('velocity')
+# The defaults are the rules; the env overrides exist so k8s/configmap.yaml can state them.
+FLAG_THRESHOLD = float(os.getenv("FLAG_THRESHOLD", "1000.00"))  # rule 1: amount > this -> flagged ('amount')
+VELOCITY_LIMIT = int(os.getenv("VELOCITY_LIMIT", "7"))  # rule 2: the 7th-or-later payment by one account...
+VELOCITY_WINDOW_SECONDS = int(os.getenv("VELOCITY_WINDOW_SECONDS", "180"))  # ...within this many seconds
 
 RETRY_SECONDS = 3
+# Kubernetes only: the consumer writes its state here about once a second, and
+# the pod's exec probes (python -m app.healthcheck) check how fresh it is.
+HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE")
 
 # These mean "the database is unreachable", not "this record is bad": the
 # consumer retries them instead of dead-lettering perfectly good payments.
@@ -191,8 +195,17 @@ def process_message(conn, raw: bytes, partition: int, offset: int) -> str:
 # --- consumer thread -----------------------------------------------------------
 
 
+def heartbeat(state: str) -> None:
+    """Record that the consumer loop is alive and what it is doing ('starting'
+    until it has a Kafka consumer, then 'consuming'). No-op without HEARTBEAT_FILE."""
+    if HEARTBEAT_FILE:
+        with suppress(OSError), open(HEARTBEAT_FILE, "w") as f:
+            f.write(state)
+
+
 def make_consumer(stop: threading.Event) -> KafkaConsumer | None:
     while not stop.is_set():
+        heartbeat("starting")
         try:
             return KafkaConsumer(
                 TOPIC_NAME,
@@ -223,6 +236,7 @@ def _process_with_retry(conn, msg, stop: threading.Event):
             return conn, True
         except Exception as exc:  # noqa: BLE001 - never drop a message; wait and retry
             log.warning("could not process %s (%s); retrying", source, exc)
+            heartbeat("consuming")  # alive, waiting for the DB: no reason to restart the pod
             if conn is not None:
                 _close_quietly(conn)
                 conn = None
@@ -239,6 +253,7 @@ def consume_loop(stop: threading.Event) -> None:
     conn = None
     try:
         while not stop.is_set():
+            heartbeat("consuming")
             try:
                 batches = consumer.poll(timeout_ms=1000)
                 done = True

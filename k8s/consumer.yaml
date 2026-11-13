@@ -1,0 +1,47 @@
+# The consumer: reads payments from Kafka and stores each one in Postgres
+# (raw_payments). Starts with one copy. All copies share one consumer group, so
+# Kafka splits the topic's partitions between them: with 3 partitions, at most
+# 3 replicas do work (a 4th would sit idle).
+#   kubectl scale deployment/consumer --replicas=3
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  labels: {app: consumer}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: consumer}
+  template:
+    metadata:
+      labels: {app: consumer}
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 15  # SIGTERM: finish the current message, exit without committing
+      containers:
+        - name: consumer
+          image: fintech-pipeline:ci
+          imagePullPolicy: Never
+          command: ["python", "-m", "app.consumer"]
+          envFrom:
+            - configMapRef: {name: pipeline-config}
+          env:
+            - name: HEARTBEAT_FILE
+              value: /tmp/consumer-heartbeat
+          resources:
+            requests: {cpu: 250m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 192Mi}
+          # No HTTP server here: the loop writes a heartbeat file about once a
+          # second, and these probes check it (app/healthcheck.py).
+          readinessProbe:  # has a Kafka consumer and is polling
+            exec:
+              command: ["python", "-m", "app.healthcheck", "--max-age", "15", "--require", "consuming"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:  # the loop is still turning (waiting on a DB outage counts as alive)
+            exec:
+              command: ["python", "-m", "app.healthcheck", "--max-age", "60"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
