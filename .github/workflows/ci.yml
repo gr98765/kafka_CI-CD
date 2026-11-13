@@ -68,9 +68,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      DB_HOST: localhost
-      DB_PORT: 5432  # Postgres NodePort, mapped by .github/kind-config.yaml
-      K8S_API: http://localhost:8080
+      # The runner reaches the cluster only through kubectl port-forward (below).
+      # 127.0.0.1, not localhost, so nothing tries IPv6 first.
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      K8S_API: http://127.0.0.1:8080
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -87,7 +89,6 @@ jobs:
         uses: helm/kind-action@v1.12.0
         with:
           cluster_name: fintech
-          config: .github/kind-config.yaml
 
       - name: Build the image and load it into kind
         run: |
@@ -113,25 +114,64 @@ jobs:
           kubectl apply -f k8s/api.yaml -f k8s/consumer.yaml
           kubectl rollout status deployment/api --timeout=300s
           kubectl rollout status deployment/consumer --timeout=300s
-          kubectl get pods -o wide
+
+      - name: Wait until everything is ready
+        run: |
+          kubectl wait --for=condition=available deployment --all --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=kafka --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=api --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=consumer --timeout=300s
+          kubectl wait --for=condition=complete job/create-topics --timeout=60s
+          kubectl get pods,svc -o wide
+
+      # Background port-forwards to the Services, each in a loop that restarts
+      # it if it drops (kubectl port-forward exits on some connection errors).
+      # They keep running for the later steps; the runner ends them with the job.
+      - name: Port-forward the API and Postgres to the runner
+        run: |
+          nohup bash -c 'while true; do kubectl port-forward --address 127.0.0.1 svc/api 8080:8000; echo "api port-forward exited ($?), restarting"; sleep 1; done' > /tmp/pf-api.log 2>&1 &
+          nohup bash -c 'while true; do kubectl port-forward --address 127.0.0.1 svc/postgres 5432:5432; echo "postgres port-forward exited ($?), restarting"; sleep 1; done' > /tmp/pf-postgres.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS "$K8S_API/health"; then echo; echo "API /health OK"; break; fi
+            sleep 2
+          done
+          curl -fsS "$K8S_API/health" > /dev/null || { echo "API /health not answering through the port-forward"; cat /tmp/pf-api.log; exit 1; }
+          python - <<'EOF'
+          import os, sys, time
+          import psycopg2
+          for _ in range(30):
+              try:
+                  psycopg2.connect(host=os.environ["DB_HOST"], port=os.environ["DB_PORT"], user="fintech",
+                                   password="fintech", dbname="transactions_db", connect_timeout=3).close()
+                  print("Postgres OK")
+                  sys.exit(0)
+              except psycopg2.OperationalError as exc:
+                  error = exc
+                  time.sleep(2)
+          sys.exit(f"Postgres not reachable through the port-forward: {error}")
+          EOF
 
       - name: Smoke, backlog and recovery tests
         run: python -m scripts.k8s_smoke --smoke 500 --payments 10000 --replicas 1,3
 
-      - name: Show pods that are not ready
+      - name: Diagnostics
         if: failure()
         run: |
-          kubectl get pods -o wide || true
+          kubectl get pods,svc,endpoints -o wide || true
           kubectl get events --sort-by=.lastTimestamp | tail -n 40 || true
-          # READY column "x/y" with x < y, ignoring the finished topic Job pod
-          for pod in $(kubectl get pods --no-headers | awk '{split($2, r, "/"); if (r[1] != r[2] && $3 != "Completed") print $1}'); do
-            echo "::group::$pod"
-            kubectl describe pod "$pod"
+          # The API and consumer pods always; any other pod only if it is not ready
+          # (READY column "x/y" with x < y, ignoring the finished topic Job pod).
+          pods="$(kubectl get pods -l 'app in (api,consumer)' -o name | sed 's|pod/||')"
+          pods="$pods $(kubectl get pods -l 'app notin (api,consumer)' --no-headers 2>/dev/null | awk '{split($2, r, "/"); if (r[1] != r[2] && $3 != "Completed") print $1}')"
+          for pod in $pods; do
+            echo "::group::describe + logs: $pod"
+            kubectl describe pod "$pod" || true
             kubectl logs "$pod" --all-containers --tail=200 || true
+            echo "--- previous container (if it restarted) ---"
             kubectl logs "$pod" --all-containers --previous --tail=200 || true
             echo "::endgroup::"
           done
-          echo "::group::recent API and consumer logs"
-          kubectl logs deployment/api --tail=50 || true
-          kubectl logs -l app=consumer --prefix --tail=50 || true
+          echo "::group::port-forward logs"
+          cat /tmp/pf-api.log /tmp/pf-postgres.log 2>/dev/null || true
           echo "::endgroup::"

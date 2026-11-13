@@ -178,7 +178,7 @@ persistent disk. It does not run on the laptop (not enough memory).
  │        │                                        Deployment postgres ◀──┘         │
  │        │                                         (raw_payments)  ▲               │
  └────────┼─────────────────────────────────────────────────────────┼───────────────┘
-   localhost:8080 (NodePort 30080)                      localhost:5432 (NodePort 30432)
+  127.0.0.1:8080 (port-forward svc/api)            127.0.0.1:5432 (port-forward svc/postgres)
           └──────────────── python -m scripts.k8s_smoke ─────────────┘
 ```
 
@@ -189,10 +189,12 @@ persistent disk. It does not run on the laptop (not enough memory).
 | `k8s/topic-job.yaml` | One-off Job that creates the topic with 3 partitions |
 | `k8s/api.yaml` | API Deployment (HTTP probes, limits) and its Service |
 | `k8s/consumer.yaml` | Consumer Deployment; probes check a heartbeat file (`app/healthcheck.py`) |
-| `.github/kind-config.yaml` | The kind cluster, with the two NodePorts mapped to the runner |
 
 The `k8s-smoke` job creates the cluster, builds and loads the image, starts Kafka and Postgres,
-runs the topic Job, starts the API and the consumer, then runs `python -m scripts.k8s_smoke`:
+runs the topic Job, starts the API and the consumer, and waits until every Deployment and pod is
+ready (printing `kubectl get pods,svc`). All Services are ClusterIP: the runner reaches the API and
+Postgres through background `kubectl port-forward`s, restarted if they drop, and checked (API
+`/health`, a Postgres connection) before the test starts. Then it runs `python -m scripts.k8s_smoke`:
 
 1. **Smoke**: 500 payments with 1 consumer; prints sent / stored / lost / duplicated.
 2. **Backlog**: 10,000 payments sent while the consumer is scaled to 0, then the consumer is
@@ -202,7 +204,8 @@ runs the topic Job, starts the API and the consumer, then runs `python -m script
    prints how long until the backlog is back where it was, plus lost / duplicated.
 
 The job fails if any accepted payment is lost. On failure it prints `kubectl describe` and logs
-for every pod that is not ready. The summary table also appears on the run's summary page.
+(including the previous container, if it restarted) for the API and consumer pods and for any other
+pod that is not ready, plus the port-forward logs. The summary table also appears on the run's summary page.
 
 ## Known gotcha
 

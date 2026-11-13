@@ -1,6 +1,6 @@
 # The HTTP API: one copy that takes payments on POST /transactions and hands
-# them to Kafka (it does not write to Postgres). The Service exposes it on
-# NodePort 30080, which the kind config maps to localhost:8080 on the runner.
+# them to Kafka (it does not write to Postgres). The Service gives it the
+# in-cluster name api:8000; CI reaches it with kubectl port-forward svc/api 8080:8000.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -42,9 +42,8 @@ kind: Service
 metadata:
   name: api
 spec:
-  type: NodePort
+  type: ClusterIP
   selector: {app: api}
   ports:
     - port: 8000
       targetPort: 8000
-      nodePort: 30080  # -> localhost:8080 via k8s/kind-config.yaml
