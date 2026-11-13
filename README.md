@@ -103,6 +103,22 @@ fixed rules' validation false alarms. Payments are held as numpy arrays (about 4
 a test checks the array version gives the same recall, precision and false alarms as the
 one-object-per-payment version.
 
+### Load test and freshness
+
+Needs the whole stack (`docker compose up -d`) and `pip install -r requirements-dev.txt`.
+
+```bash
+python -m scripts.report reset       # empty raw_payments, payments_clean, payments_quarantine
+locust -f scripts/locustfile.py --headless --host http://localhost:8000 -u 50 -r 10 -t 2m --csv results/locust
+python -m scripts.report summary     # req/s, p50/p95/p99, failures; then sent vs stored, lost, duplicated
+python -m scripts.freshness          # 20 single payments: seconds from POST until in raw_payments
+```
+
+Every Locust request is a record sampled from `data/synthetic/payments_raw.jsonl` with a fresh
+`payment_id`; users send back-to-back with no wait. `summary` waits for the consumer to drain before
+counting. The API replies after handing the payment to Kafka, so its latency measures the hand-off,
+not saving to Postgres. Numbers depend on the machine and Docker's memory limit; both reports print it.
+
 ## Running tests
 
 ```bash
